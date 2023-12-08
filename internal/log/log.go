@@ -3,10 +3,11 @@ package log
 import (
 	"log/slog"
 	"os"
+	"strings"
 )
 
 func getLogLevel(level string) slog.Level {
-	switch level {
+	switch strings.ToUpper(level) {
 	case "DEBUG":
 		return slog.LevelDebug
 	case "INFO":
@@ -25,4 +26,5 @@ var opts = &slog.HandlerOptions{
 }
 
 var handler = slog.NewJSONHandler(os.Stdout, opts)
+
 var Logger = slog.New(handler)
