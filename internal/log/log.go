@@ -6,6 +6,12 @@ import (
 	"strings"
 )
 
+// getLogLevel returns the corresponding slog.Level based on the provided level string.
+// If the level string is "DEBUG", it returns slog.LevelDebug.
+// If the level string is "INFO", it returns slog.LevelInfo.
+// If the level string is "WARN", it returns slog.LevelWarn.
+// If the level string is "ERROR", it returns slog.LevelError.
+// For any other level string, it returns slog.LevelInfo.
 func getLogLevel(level string) slog.Level {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
@@ -27,4 +33,5 @@ var opts = &slog.HandlerOptions{
 
 var handler = slog.NewJSONHandler(os.Stdout, opts)
 
+// Logger is a global logger instance that can be used for logging messages.
 var Logger = slog.New(handler)

@@ -5,68 +5,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
 
-	"gcp-wli-token-fetcher/internal/log"
 	"gcp-wli-token-fetcher/internal/metadata"
 	"gcp-wli-token-fetcher/internal/tools"
 
 	"github.com/robfig/cron/v3"
 )
-
-func refreshToken(ctx context.Context, tokenFile, GSAName, audience, scope string) error {
-	fileExists, err := tools.FileExists(tokenFile)
-	if err != nil {
-		log.Logger.Error(err.Error())
-
-		os.Exit(2)
-	}
-
-	if fileExists {
-		token, err := os.ReadFile(tokenFile)
-		if err != nil {
-			log.Logger.Error(err.Error())
-			return err
-		}
-
-		expIn, err := tools.TokenExpiresIn(string(token))
-		if err != nil {
-			log.Logger.Error(err.Error())
-
-		}
-		d, _ := time.ParseDuration(ctx.Value("renewthreshold").(string))
-		if expIn > d {
-			log.Logger.Debug(fmt.Sprintf("Token expires in %s (threshold %s), not scheduling for renewal", expIn, d))
-			return nil
-		} else {
-			log.Logger.Info(fmt.Sprintf("Token expires in %s (threshold %s), scheduling for renewal", expIn, d))
-		}
-	} else {
-		dir, _ := filepath.Split(tokenFile)
-
-		err := os.MkdirAll(dir, os.ModePerm)
-		if err != nil {
-			log.Logger.Error(err.Error())
-		}
-	}
-
-	token, err := metadata.GetGSAToken(GSAName, audience, scope)
-	if err != nil {
-		log.Logger.Error(err.Error())
-		return err
-	}
-
-	f, err := os.OpenFile(tokenFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		log.Logger.Error(err.Error())
-		return err
-	}
-	log.Logger.Debug(fmt.Sprintf("Writing token for service account %s into %s", GSAName, tokenFile))
-	f.Write(token)
-	f.Close()
-	return nil
-}
 
 func main() {
 	ctx := context.Background()
@@ -78,6 +23,8 @@ func main() {
 	var cronspec = flag.String("cronspec", tools.GetEnv("CRON_SPEC", "* * * * *"), "Schedule for token renewal routine. Default \"* * * * *\". Envar CRON_SPEC")
 	var renewthreshold = flag.String("renewthreshold", tools.GetEnv("TOKEN_RENEW_THRESHOLD", "30m0s"), "Token TTL threshold. The token will be renewed if below this value. Default \"30m00s\". Envar TOKEN_RENEW_THRESHOLD")
 	flag.Parse()
+	var metadataserverurl = flag.String("metadataserverurl", tools.GetEnv("METADATA_SERVER_URL", "http://metadata.google.internal"), "Metadata server URL. Default \"http://metadata.google.internal/\". Envar METADATA_SERVER_URL")
+	flag.Parse()
 
 	if *tokenFile == "" || *GSAName == "" || *audience == "" || *scope == "" {
 		fmt.Println("Mandatory arguments missing. Usage:")
@@ -87,11 +34,18 @@ func main() {
 
 	ctx = context.WithValue(ctx, "renewthreshold", *renewthreshold)
 
-	refreshToken(ctx, *tokenFile, *GSAName, *audience, *scope)
+	i := metadata.GSA{
+		Name:     *GSAName,
+		Audience: *audience,
+		Scope:    *scope,
+	}
+
+	// Trigger renewal on startup
+	i.RefreshToken(ctx, *tokenFile, *metadataserverurl)
 
 	c := cron.New()
 	c.AddFunc(*cronspec, func() {
-		refreshToken(ctx, *tokenFile, *GSAName, *audience, *scope)
+		i.RefreshToken(ctx, *tokenFile, *metadataserverurl)
 	})
 	c.Start()
 	time.Sleep(time.Duration(1<<63 - 1))

@@ -18,6 +18,8 @@ var (
 	jwtDecodeFail = errors.New("Failed to decode JWT")
 )
 
+// GetEnv retrieves the value of the environment variable specified by the key parameter.
+// If the environment variable is not found, it returns the fallback value.
 func GetEnv(key, fallback string) string {
 	if value, ok := os.LookupEnv(key); ok {
 		return value
@@ -77,7 +79,7 @@ func getJWTExp(token string) (time.Time, error) {
 func TokenExpiresIn(token string) (time.Duration, error) {
 	exp, err := getJWTExp(token)
 	if err != nil {
-		return 0, err
+		return time.Duration(time.Duration(0).Seconds()), err
 	}
 
 	return exp.Sub(time.Now()), nil
