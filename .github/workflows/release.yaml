@@ -1,0 +1,35 @@
+name: Release
+
+on:
+  release:
+    types: [created]
+
+permissions:
+    contents: write
+    packages: write
+
+jobs:
+  releases-matrix:
+    name: Release Go Binary
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux, darwin]
+        goarch: [amd64, arm64]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: wangyoucao577/go-release-action@v1
+      env:
+        CGO_ENABLED: 0
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        goos: ${{ matrix.goos }}
+        goarch: ${{ matrix.goarch }}
+        binary_name: "gcp-wli-token-fetcher"
+        compress_assets: "OFF"
+        ldflags: >-
+          -s -w
+          -X gcp-wli-token-fetcher/types.Version=${{ github.event.release.tag_name }}
+          -X gcp-wli-token-fetcher/types.Commit=${{ github.sha }}
+          -X gcp-wli-token-fetcher/types.Date=${{ github.event.release.created_at }}
+        build_flags: "-trimpath"
