@@ -13,7 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       security-events: write # Required for the security events
-      actions: read # Required for actions permissions
     env:
       GO111MODULE: on
     steps:
