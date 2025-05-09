@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "dependencyDashboard": true,
+  "extends": [
+    "config:recommended"
+  ],
+  "timezone": "Europe/Madrid",
+  "schedule": [
+    "* 20-23 1 * *"
+  ],
+  "rebaseWhen": "behind-base-branch",
+  "separateMajorMinor": true,
+  "separateMinorPatch": true
+}
