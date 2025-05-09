@@ -12,6 +12,7 @@ jobs:
     name: Analyze (go)
     runs-on: ubuntu-latest
     permissions:
+      contents: read
       security-events: write # Required for the security events
     env:
       GO111MODULE: on
