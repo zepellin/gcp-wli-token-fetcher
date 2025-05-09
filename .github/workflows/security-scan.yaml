@@ -14,6 +14,7 @@ jobs:
     permissions:
       contents: read
       security-events: write # Required for the security events
+      actions: read # Required for the actions
     env:
       GO111MODULE: on
     steps:
