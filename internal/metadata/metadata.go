@@ -5,127 +5,134 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
 
-	"gcp-wli-token-fetcher/internal/log"
-	"gcp-wli-token-fetcher/internal/tools"
+	"github.com/golang-jwt/jwt/v5"
 )
 
+// GSA identifies the Google Service Account to fetch identity tokens for.
 type GSA struct {
 	Name     string // Name of the GSA (Google Service Account)
 	Audience string // Audience for the GSA token
 	Scope    string // Scope for the GSA token
 }
 
-var (
-	metadataRequestFail = errors.New("Metadata server request failed")
-)
+var client = &http.Client{Timeout: 10 * time.Second}
 
-// Token retrieves a token for the service account.
-// It takes the metadata server URL as a parameter and returns the token as a byte array and an error, if any.
-// The function constructs a request URL using the service account name, audience, and scope.
-// It then sends a GET request to the metadata server with the constructed URL and retrieves the token.
-// The retrieved token is returned as a byte array.
-// If there is an error during the request or reading the response body, an empty byte array and the error are returned.
-func (g *GSA) token(metadataServerURL string) ([]byte, error) {
-	log.Logger.Debug(fmt.Sprintf("Retrieving token for service account %s with audience %s and scope %s", g.Name, g.Audience, g.Scope))
+// RefreshToken ensures the token file contains a token that stays valid for
+// at least renewThreshold. It fetches a new token from the metadata server
+// when the existing one is missing, unparseable, or expiring soon, and writes
+// it atomically so readers never observe a partial token.
+func (g *GSA) RefreshToken(ctx context.Context, tokenFile, metadataServerURL string, renewThreshold time.Duration) error {
+	if existing, err := os.ReadFile(tokenFile); err == nil {
+		expIn, err := tokenExpiresIn(string(existing))
+		switch {
+		case err != nil:
+			slog.Warn("could not parse existing token, renewing", "error", err)
+		case expIn > renewThreshold:
+			slog.Debug("token still valid, skipping renewal", "expiresIn", expIn.String(), "threshold", renewThreshold.String())
+			return nil
+		default:
+			slog.Info("token expiring soon, renewing", "expiresIn", expIn.String(), "threshold", renewThreshold.String())
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("reading token file: %w", err)
+	}
 
-	requestURL := fmt.Sprintf("%s/computeMetadata/v1/instance/service-accounts/%s/identity?audience=%s&scope=%s", metadataServerURL, g.Name, g.Audience, g.Scope)
-	log.Logger.Debug(fmt.Sprintf("Making HTTP request to %s", requestURL))
-
-	client := &http.Client{}
-	req, err := http.NewRequest("GET", requestURL, nil)
+	token, err := g.token(ctx, metadataServerURL)
 	if err != nil {
-		return []byte{}, err
+		return err
+	}
+
+	slog.Debug("writing token", "gsa", g.Name, "file", tokenFile)
+	return writeFileAtomic(tokenFile, token)
+}
+
+// token fetches an identity token for the service account from the metadata
+// server.
+func (g *GSA) token(ctx context.Context, metadataServerURL string) ([]byte, error) {
+	query := url.Values{"audience": {g.Audience}, "scope": {g.Scope}}
+	requestURL := fmt.Sprintf("%s/computeMetadata/v1/instance/service-accounts/%s/identity?%s",
+		metadataServerURL, url.PathEscape(g.Name), query.Encode())
+	slog.Debug("requesting token from metadata server", "gsa", g.Name, "url", requestURL)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return nil, err
 	}
 	req.Header.Set("Metadata-Flavor", "Google")
+
 	res, err := client.Do(req)
-	if err != nil || res.StatusCode != 200 {
-		body, _ := io.ReadAll(res.Body)
-		log.Logger.Error(fmt.Sprintf("HTTP request error, code %d, message %s", res.StatusCode, body))
-		return []byte{}, metadataRequestFail
+	if err != nil {
+		return nil, fmt.Errorf("metadata server request failed: %w", err)
 	}
 	defer res.Body.Close()
 
-	if b, err := io.ReadAll(res.Body); err == nil {
-		return b, nil
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading metadata server response: %w", err)
 	}
-	log.Logger.Debug(fmt.Sprintf("Retrieved token for service account %s with audience %s and scope %s successfully", g.Name, g.Audience, g.Scope))
-	log.Logger.Debug(fmt.Sprintf("Token: %s", res.Body))
-	return []byte{}, err
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("metadata server returned status %d: %s", res.StatusCode, body)
+	}
+	return body, nil
 }
 
-// RefreshToken refreshes the token for the service account.
-// It reads the token from the specified token file, checks if it is expired,
-// and schedules it for renewal if necessary. If the token file does not exist,
-// it creates the necessary directory structure and fetches a new token from
-// the metadata server. The refreshed token is then written back to the token file.
-//
-// Parameters:
-// - ctx: The context.Context object for the operation.
-// - tokenFile: The path to the token file.
-// - metadataServerURL: The URL of the metadata server.
-//
-// Returns:
-// - error: An error if any occurred during the token refresh process.
-func (g *GSA) RefreshToken(ctx context.Context, tokenFile, metadataServerURL string) error {
-	fileExists, err := tools.FileExists(tokenFile)
+// tokenExpiresIn returns the remaining time until the JWT expires. The token
+// signature is not verified; only the exp claim is inspected.
+func tokenExpiresIn(token string) (time.Duration, error) {
+	claims := jwt.MapClaims{}
+	if _, _, err := jwt.NewParser().ParseUnverified(token, claims); err != nil {
+		return 0, fmt.Errorf("parsing token: %w", err)
+	}
+	exp, err := claims.GetExpirationTime()
 	if err != nil {
-		log.Logger.Error(err.Error())
+		return 0, fmt.Errorf("reading exp claim: %w", err)
+	}
+	if exp == nil {
+		return 0, errors.New("token has no exp claim")
+	}
+	return time.Until(exp.Time), nil
+}
 
-		os.Exit(2)
+// writeFileAtomic writes data to path via a temp file and rename, creating
+// parent directories as needed. The file is world-readable (0644) because
+// the token is typically consumed by another container running as a
+// different user.
+func writeFileAtomic(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating token directory: %w", err)
 	}
 
-	if fileExists {
-		token, err := os.ReadFile(tokenFile)
-		if err != nil {
-			log.Logger.Error(err.Error())
-			return err
-		}
-
-		expIn, err := tools.TokenExpiresIn(string(token))
-		if err != nil {
-			log.Logger.Error(err.Error())
-			// If the token cannot be parsed, set the expiration time to 0
-			expIn = time.Duration(0)
-		}
-
-		d, err := time.ParseDuration(ctx.Value("renewthreshold").(string))
-		if err != nil {
-			log.Logger.Error(fmt.Sprintf("Failed to parse renewalthreshold as duration %s", ctx.Value("renewthreshold").(string)))
-		}
-
-		if expIn > d {
-			log.Logger.Debug(fmt.Sprintf("Token expires in %s (threshold %s), not scheduling for renewal", expIn, d))
-			return nil
-		} else {
-			log.Logger.Info(fmt.Sprintf("Token expires in %s (threshold %s), scheduling for renewal", expIn, d))
-		}
-	} else {
-		dir, _ := filepath.Split(tokenFile)
-
-		err := os.MkdirAll(dir, os.ModePerm)
-		if err != nil {
-			log.Logger.Error(err.Error())
-		}
-	}
-
-	token, err := g.token(metadataServerURL)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
 	if err != nil {
-		log.Logger.Error(err.Error())
-		return err
+		return fmt.Errorf("creating temp token file: %w", err)
 	}
+	defer os.Remove(tmp.Name())
 
-	f, err := os.OpenFile(tokenFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		log.Logger.Error(err.Error())
-		return err
+	if err := writeAndClose(tmp, data); err != nil {
+		return fmt.Errorf("writing token file: %w", err)
 	}
-	log.Logger.Debug(fmt.Sprintf("Writing token for service account %s into %s", g.Name, tokenFile))
-	f.Write(token)
-	f.Close()
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("replacing token file: %w", err)
+	}
 	return nil
+}
+
+func writeAndClose(f *os.File, data []byte) error {
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
