@@ -1,121 +1,247 @@
 package metadata
 
 import (
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"encoding/pem"
-	"errors"
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
 
-func TestToken(t *testing.T) {
-	g := &GSA{
-		Name:     "test-account",
-		Audience: "test-audience",
-		Scope:    "test-scope",
-	}
+var testGSA = GSA{
+	Name:     "test-account",
+	Audience: "test-audience",
+	Scope:    "test-scope",
+}
 
-	// Generate a mock token
-	k, err := GeneratePEMPrivateKey()
+// generateJWT returns a signed JWT expiring after expiresIn.
+func generateJWT(t *testing.T, expiresIn time.Duration) string {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"aud": testGSA.Audience,
+		"sub": testGSA.Name,
+		"iat": time.Now().Unix(),
+		"exp": time.Now().Add(expiresIn).Unix(),
+	})
+	signed, err := token.SignedString([]byte("test-secret"))
 	if err != nil {
-		t.Errorf("Failed to generate mock private key: %v", err)
+		t.Fatalf("failed to sign test token: %v", err)
 	}
-	j, err := GenerateJWT(k, jwt.MapClaims{"aud": g.Audience, "scope": g.Scope, "sub": g.Name})
-	if err != nil {
-		t.Errorf("Failed to generate mock token: %v", err)
-	}
+	return signed
+}
 
-	// Test case 1: Successful request
+// newMetadataServer starts a test server that mimics the GCE metadata
+// endpoint, serving token and counting requests via the returned counter.
+func newMetadataServer(t *testing.T, token string, requests *int) *httptest.Server {
+	t.Helper()
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*requests++
 		if r.Header.Get("Metadata-Flavor") != "Google" {
 			http.Error(w, "Invalid Metadata-Flavor header", http.StatusBadRequest)
 			return
 		}
-		if r.URL.Path != fmt.Sprintf("/computeMetadata/v1/instance/service-accounts/%s/identity", g.Name) {
-			http.Error(w, "Invalid URL path", http.StatusBadRequest)
+		if r.URL.Path != fmt.Sprintf("/computeMetadata/v1/instance/service-accounts/%s/identity", testGSA.Name) {
+			http.Error(w, "Invalid URL path", http.StatusNotFound)
 			return
 		}
-		if r.URL.Query().Get("audience") != g.Audience || r.URL.Query().Get("scope") != g.Scope {
+		if r.URL.Query().Get("audience") != testGSA.Audience || r.URL.Query().Get("scope") != testGSA.Scope {
 			http.Error(w, "Invalid audience or scope", http.StatusBadRequest)
 			return
 		}
-		w.Write(j)
+		w.Write([]byte(token))
 	}))
-	defer ts.Close()
-
-	result, err := g.token("http://" + ts.Listener.Addr().String())
-	if err != nil {
-		t.Errorf("Testtoken failed for a successful request: %v", err)
-	}
-	if string(result) != string(j) {
-		t.Errorf("Testtoken failed for a successful request. Expected token: %s, Got: %s", j, result)
-	}
-
-	// Test case 2: HTTP request error
-	ts = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-	}))
-	defer ts.Close()
-
-	result, err = g.token("http://" + ts.Listener.Addr().String())
-	if err == nil {
-		t.Errorf("Testtoken did not return an error for an HTTP request error")
-	}
-	if !errors.Is(err, metadataRequestFail) {
-		t.Errorf("Testtoken did not return metadataRequestFail error for an HTTP request error: %v, %v", err, metadataRequestFail)
-	}
-	if string(result) != "" {
-		t.Errorf("Testtoken failed for an HTTP request error. Expected empty result, Got: %s", result)
-	}
+	t.Cleanup(ts.Close)
+	return ts
 }
 
-// GeneratePEMPrivateKey generates a PEM private key.
-func GeneratePEMPrivateKey() ([]byte, error) {
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate private key: %v", err)
-	}
+func TestToken(t *testing.T) {
+	ctx := context.Background()
+	want := generateJWT(t, time.Hour)
 
-	privateKeyBytes := x509.MarshalPKCS1PrivateKey(privateKey)
-	pemPrivateKey := &pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: privateKeyBytes,
-	}
+	t.Run("success", func(t *testing.T) {
+		var requests int
+		ts := newMetadataServer(t, want, &requests)
 
-	privateKeyPEM := pem.EncodeToMemory(pemPrivateKey)
-	return privateKeyPEM, nil
+		got, err := testGSA.token(ctx, ts.URL)
+		if err != nil {
+			t.Fatalf("token() returned an error: %v", err)
+		}
+		if string(got) != want {
+			t.Errorf("token() = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("http error status", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		}))
+		t.Cleanup(ts.Close)
+
+		got, err := testGSA.token(ctx, ts.URL)
+		if err == nil {
+			t.Fatal("token() did not return an error for a 500 response")
+		}
+		if !strings.Contains(err.Error(), "500") {
+			t.Errorf("token() error should mention status code, got: %v", err)
+		}
+		if got != nil {
+			t.Errorf("token() = %s, want nil on error", got)
+		}
+	})
+
+	t.Run("unreachable server", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		ts.Close() // shut down immediately so the address refuses connections
+
+		_, err := testGSA.token(ctx, ts.URL)
+		if err == nil {
+			t.Fatal("token() did not return an error for an unreachable server")
+		}
+	})
 }
 
-// GenerateJWT generates a JSON Web Token (JWT) using the provided private key and claims.
-func GenerateJWT(privateKey []byte, claims jwt.MapClaims) ([]byte, error) {
-	block, _ := pem.Decode(privateKey)
-	if block == nil {
-		return []byte{}, fmt.Errorf("failed to decode private key")
-	}
+func TestRefreshToken(t *testing.T) {
+	ctx := context.Background()
+	threshold := 30 * time.Minute
 
-	key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
-	if err != nil {
-		return []byte{}, fmt.Errorf("failed to parse private key: %v", err)
-	}
+	t.Run("creates file and parent directories", func(t *testing.T) {
+		want := generateJWT(t, time.Hour)
+		var requests int
+		ts := newMetadataServer(t, want, &requests)
+		tokenFile := filepath.Join(t.TempDir(), "nested", "dir", "token")
 
-	claims["iat"] = time.Now().Unix()
-	claims["exp"] = time.Now().Add(time.Hour).Unix()
+		if err := testGSA.RefreshToken(ctx, tokenFile, ts.URL, threshold); err != nil {
+			t.Fatalf("RefreshToken() returned an error: %v", err)
+		}
+		got, err := os.ReadFile(tokenFile)
+		if err != nil {
+			t.Fatalf("failed to read token file: %v", err)
+		}
+		if string(got) != want {
+			t.Errorf("token file = %s, want %s", got, want)
+		}
+	})
 
-	token := jwt.NewWithClaims(jwt.SigningMethodRS256, claims)
-	token.Header["kid"] = "key-id"
-	token.Header["alg"] = "RS256"
+	t.Run("skips renewal above threshold", func(t *testing.T) {
+		existing := generateJWT(t, time.Hour)
+		var requests int
+		ts := newMetadataServer(t, generateJWT(t, time.Hour), &requests)
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte(existing), 0o644); err != nil {
+			t.Fatal(err)
+		}
 
-	signedToken, err := token.SignedString(key)
-	if err != nil {
-		return []byte{}, fmt.Errorf("failed to sign token: %v", err)
-	}
+		if err := testGSA.RefreshToken(ctx, tokenFile, ts.URL, threshold); err != nil {
+			t.Fatalf("RefreshToken() returned an error: %v", err)
+		}
+		if requests != 0 {
+			t.Errorf("RefreshToken() made %d metadata requests for a valid token, want 0", requests)
+		}
+		got, _ := os.ReadFile(tokenFile)
+		if string(got) != existing {
+			t.Error("RefreshToken() replaced a token that was still valid")
+		}
+	})
 
-	return []byte(signedToken), nil
+	t.Run("renews below threshold", func(t *testing.T) {
+		want := generateJWT(t, time.Hour)
+		var requests int
+		ts := newMetadataServer(t, want, &requests)
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte(generateJWT(t, time.Minute)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := testGSA.RefreshToken(ctx, tokenFile, ts.URL, threshold); err != nil {
+			t.Fatalf("RefreshToken() returned an error: %v", err)
+		}
+		if requests != 1 {
+			t.Errorf("RefreshToken() made %d metadata requests, want 1", requests)
+		}
+		got, _ := os.ReadFile(tokenFile)
+		if string(got) != want {
+			t.Errorf("token file = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("renews unparseable token", func(t *testing.T) {
+		want := generateJWT(t, time.Hour)
+		var requests int
+		ts := newMetadataServer(t, want, &requests)
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte("not-a-jwt"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := testGSA.RefreshToken(ctx, tokenFile, ts.URL, threshold); err != nil {
+			t.Fatalf("RefreshToken() returned an error: %v", err)
+		}
+		got, _ := os.ReadFile(tokenFile)
+		if string(got) != want {
+			t.Errorf("token file = %s, want %s", got, want)
+		}
+	})
+
+	t.Run("keeps existing token when server unreachable", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		ts.Close()
+		existing := generateJWT(t, time.Minute) // below threshold, triggers renewal
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte(existing), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := testGSA.RefreshToken(ctx, tokenFile, ts.URL, threshold); err == nil {
+			t.Fatal("RefreshToken() did not return an error for an unreachable server")
+		}
+		got, _ := os.ReadFile(tokenFile)
+		if string(got) != existing {
+			t.Error("RefreshToken() modified the token file despite the fetch failing")
+		}
+	})
+}
+
+func TestTokenExpiresIn(t *testing.T) {
+	t.Run("valid token", func(t *testing.T) {
+		expIn, err := tokenExpiresIn(generateJWT(t, time.Hour))
+		if err != nil {
+			t.Fatalf("tokenExpiresIn() returned an error: %v", err)
+		}
+		if expIn < 59*time.Minute || expIn > time.Hour {
+			t.Errorf("tokenExpiresIn() = %s, want ~1h", expIn)
+		}
+	})
+
+	t.Run("expired token", func(t *testing.T) {
+		expIn, err := tokenExpiresIn(generateJWT(t, -time.Hour))
+		if err != nil {
+			t.Fatalf("tokenExpiresIn() returned an error: %v", err)
+		}
+		if expIn >= 0 {
+			t.Errorf("tokenExpiresIn() = %s, want negative for an expired token", expIn)
+		}
+	})
+
+	t.Run("malformed token", func(t *testing.T) {
+		if _, err := tokenExpiresIn("not-a-jwt"); err == nil {
+			t.Error("tokenExpiresIn() did not return an error for a malformed token")
+		}
+	})
+
+	t.Run("missing exp claim", func(t *testing.T) {
+		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{"sub": "x"})
+		signed, err := token.SignedString([]byte("test-secret"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tokenExpiresIn(signed); err == nil {
+			t.Error("tokenExpiresIn() did not return an error for a token without exp")
+		}
+	})
 }

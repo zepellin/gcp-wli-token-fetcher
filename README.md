@@ -11,7 +11,7 @@ identity token but cannot mint one itself.
 
 ## What it does
 
-On startup, and then on a cron schedule, the fetcher:
+On startup, and then at a fixed interval, the fetcher:
 
 1. Reads the existing token from `TOKEN_FILE` (if present) and inspects its JWT
    `exp` claim.
@@ -25,7 +25,8 @@ On startup, and then on a cron schedule, the fetcher:
 3. Writes the returned token back to `TOKEN_FILE` (creating parent directories
    as needed).
 
-The process runs forever, re-evaluating the token on every cron tick.
+The process runs until stopped (it handles `SIGTERM`/`SIGINT` gracefully),
+re-evaluating the token on every tick.
 
 ## Configuration
 
@@ -38,8 +39,8 @@ flag wins if both are provided.
 | `GSA_NAME`              | `-gsaname`          | yes      | —                                | Google Service Account email, e.g. `name@myproject.iam.gserviceaccount.com`.|
 | `TOKEN_AUDIENCE`        | `-audience`         | yes      | —                                | Identity token audience, e.g. `AzureADTokenExchange`.                       |
 | `TOKEN_SCOPE`           | `-scope`            | yes      | —                                | Identity token scope, e.g. `user_impersonation`.                            |
-| `CRON_SPEC`             | `-cronspec`         | no       | `* * * * *`                      | Cron schedule for the renewal routine.                                      |
-| `TOKEN_RENEW_THRESHOLD` | `-renewthreshold`   | no       | `30m0s`                          | Renew when the token's remaining TTL drops below this Go duration.          |
+| `RENEW_INTERVAL`        | `-interval`         | no       | `1m`                             | How often to check the token for renewal (Go duration).                     |
+| `TOKEN_RENEW_THRESHOLD` | `-renewthreshold`   | no       | `30m`                            | Renew when the token's remaining TTL drops below this Go duration.          |
 | `METADATA_SERVER_URL`   | `-metadataserverurl`| no       | `http://metadata.google.internal`| Base URL of the metadata server.                                            |
 | `LOG_LEVEL`             | —                   | no       | `INFO`                           | `DEBUG`, `INFO`, `WARN`, or `ERROR`. Logs are JSON on stdout.               |
 
