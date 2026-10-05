@@ -2,6 +2,6 @@ module gcp-wli-token-fetcher
 
 go 1.24.3
 
-toolchain go1.27.0
+toolchain go1.27.1
 
 require github.com/golang-jwt/jwt/v5 v5.3.1
