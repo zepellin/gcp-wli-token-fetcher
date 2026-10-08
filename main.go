@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -33,10 +34,11 @@ type config struct {
 
 func main() {
 	showVersion := flag.Bool("version", false, "Display version information")
+	check := flag.Bool("check", false, "Exit 0 if the token file holds an unexpired token, 1 otherwise. Only -file is required. Intended for use as an exec startupProbe")
 	tokenFile := flag.String("file", os.Getenv("TOKEN_FILE"), "File path for a token file. Example /data/oidc/token. (Required). Envar TOKEN_FILE")
 	gsaName := flag.String("gsaname", os.Getenv("GSA_NAME"), "Google Service account email. Example name@myproject.iam.gserviceaccount.com. (Required). Envar GSA_NAME")
 	audience := flag.String("audience", os.Getenv("TOKEN_AUDIENCE"), "Service account identity audience. Example AzureADTokenExchange. (Required). Envar TOKEN_AUDIENCE")
-	scope := flag.String("scope", os.Getenv("TOKEN_SCOPE"), "Service account identity scope. Example user_impersonation. (Required). Envar TOKEN_SCOPE")
+	scope := flag.String("scope", os.Getenv("TOKEN_SCOPE"), "Service account identity scope. Example user_impersonation. Omitted from the request when empty. Envar TOKEN_SCOPE")
 	interval := flag.String("interval", getEnv("RENEW_INTERVAL", "1m"), "How often to check the token for renewal. Default \"1m\". Envar RENEW_INTERVAL")
 	renewThreshold := flag.String("renewthreshold", getEnv("TOKEN_RENEW_THRESHOLD", "30m"), "Token TTL threshold. The token will be renewed if below this value. Default \"30m\". Envar TOKEN_RENEW_THRESHOLD")
 	metadataServerURL := flag.String("metadataserverurl", getEnv("METADATA_SERVER_URL", "http://metadata.google.internal"), "Metadata server URL. Default \"http://metadata.google.internal\". Envar METADATA_SERVER_URL")
@@ -44,6 +46,14 @@ func main() {
 
 	if *showVersion {
 		fmt.Printf("Version: %s\nCommit: %s\nBuild Date: %s\n", version, commit, date)
+		return
+	}
+
+	if *check {
+		if err := checkToken(*tokenFile); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 		return
 	}
 
@@ -72,7 +82,6 @@ func newConfig(tokenFile, gsaName, audience, scope, metadataServerURL, interval,
 		"-file":     tokenFile,
 		"-gsaname":  gsaName,
 		"-audience": audience,
-		"-scope":    scope,
 	} {
 		if value == "" {
 			missing = append(missing, name)
@@ -104,6 +113,14 @@ func newConfig(tokenFile, gsaName, audience, scope, metadataServerURL, interval,
 		interval:          parsedInterval,
 		renewThreshold:    parsedThreshold,
 	}, nil
+}
+
+// checkToken reports whether tokenFile holds an unexpired token.
+func checkToken(tokenFile string) error {
+	if tokenFile == "" {
+		return errors.New("mandatory arguments missing: -file")
+	}
+	return metadata.CheckToken(tokenFile)
 }
 
 // run refreshes the token once at startup and then on every interval tick

@@ -22,6 +22,7 @@ On startup, and then at a fixed interval, the fetcher:
    GET {METADATA_SERVER_URL}/computeMetadata/v1/instance/service-accounts/{GSA_NAME}/identity?audience={TOKEN_AUDIENCE}&scope={TOKEN_SCOPE}
    Metadata-Flavor: Google
    ```
+   The `scope` parameter is only sent when `TOKEN_SCOPE` is set.
 3. Writes the returned token back to `TOKEN_FILE` (creating parent directories
    as needed).
 
@@ -38,13 +39,20 @@ flag wins if both are provided.
 | `TOKEN_FILE`            | `-file`             | yes      | —                                | Path where the token is written, e.g. `/data/oidc/token`.                   |
 | `GSA_NAME`              | `-gsaname`          | yes      | —                                | Google Service Account email, e.g. `name@myproject.iam.gserviceaccount.com`.|
 | `TOKEN_AUDIENCE`        | `-audience`         | yes      | —                                | Identity token audience, e.g. `AzureADTokenExchange`.                       |
-| `TOKEN_SCOPE`           | `-scope`            | yes      | —                                | Identity token scope, e.g. `user_impersonation`.                            |
+| `TOKEN_SCOPE`           | `-scope`            | no       | —                                | Identity token scope, e.g. `user_impersonation` (Azure-specific).           |
 | `RENEW_INTERVAL`        | `-interval`         | no       | `1m`                             | How often to check the token for renewal (Go duration).                     |
 | `TOKEN_RENEW_THRESHOLD` | `-renewthreshold`   | no       | `30m`                            | Renew when the token's remaining TTL drops below this Go duration.          |
 | `METADATA_SERVER_URL`   | `-metadataserverurl`| no       | `http://metadata.google.internal`| Base URL of the metadata server.                                            |
 | `LOG_LEVEL`             | —                   | no       | `INFO`                           | `DEBUG`, `INFO`, `WARN`, or `ERROR`. Logs are JSON on stdout.               |
 
 Run `gcp-wli-token-fetcher -version` to print version, commit, and build date.
+
+### Checking the token
+
+`gcp-wli-token-fetcher -check` exits `0` if `TOKEN_FILE` holds a token that has
+not expired yet, and `1` otherwise (missing file, unparseable token, or expired),
+printing the reason to stderr. Only `-file` / `TOKEN_FILE` is required. It is
+meant to be used as an exec probe; see the Kubernetes example below.
 
 ## Running
 
@@ -58,13 +66,24 @@ ghcr.io/zepellin/gcp-wli-token-fetcher:latest
 
 ### Kubernetes sidecar
 
-Mount a shared volume so the main container and the fetcher both see the token file:
+Mount a shared volume so the main container and the fetcher both see the token file.
+
+Run the fetcher as a [native sidecar](https://kubernetes.io/docs/concepts/workloads/pods/sidecar-containers/)
+(an init container with `restartPolicy: Always`, Kubernetes 1.29+) with a
+`-check` startup probe. Kubernetes then holds back the main containers until the
+first token has been written, so they need no wait-for-token loop of their own:
 
 ```yaml
-extraContainers:
+initContainers:
   - name: gcp-wli-token-fetcher
     image: ghcr.io/zepellin/gcp-wli-token-fetcher:latest
     imagePullPolicy: IfNotPresent
+    restartPolicy: Always
+    startupProbe:
+      exec:
+        command: ["/gcp-wli-token-fetcher", "-check"]
+      periodSeconds: 2
+      failureThreshold: 30
     env:
       - name: TOKEN_AUDIENCE
         value: AzureADTokenExchange
@@ -84,6 +103,18 @@ extraContainers:
       - name: tokenstore
         mountPath: /home/atlantis/tokensource
 ```
+
+#### Using `-check` in probes
+
+- The startupProbe only holds back the main container when the fetcher is a
+  native sidecar. As a regular container (e.g. `extraContainers`), keep the wait loop.
+- The probe uses the container's env (`TOKEN_FILE`). If you pass `-file` in
+  `args` instead, add it to the probe command too.
+- If the first fetch fails, the next try waits for `RENEW_INTERVAL`. Make the
+  probe window (`periodSeconds × failureThreshold`) longer than that to avoid a restart.
+- `-check` also works as a liveness probe: it restarts the fetcher once the
+  token has expired. Avoid it as a readiness probe, because an expired token
+  would make the whole Pod unready.
 
 ## Development
 

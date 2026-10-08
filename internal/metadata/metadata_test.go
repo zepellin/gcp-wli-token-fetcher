@@ -77,6 +77,23 @@ func TestToken(t *testing.T) {
 		}
 	})
 
+	t.Run("omits empty scope", func(t *testing.T) {
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Has("scope") {
+				http.Error(w, "unexpected scope parameter", http.StatusBadRequest)
+				return
+			}
+			w.Write([]byte(want))
+		}))
+		t.Cleanup(ts.Close)
+
+		gsa := testGSA
+		gsa.Scope = ""
+		if _, err := gsa.token(ctx, ts.URL); err != nil {
+			t.Fatalf("token() returned an error: %v", err)
+		}
+	})
+
 	t.Run("http error status", func(t *testing.T) {
 		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
@@ -203,6 +220,41 @@ func TestRefreshToken(t *testing.T) {
 		got, _ := os.ReadFile(tokenFile)
 		if string(got) != existing {
 			t.Error("RefreshToken() modified the token file despite the fetch failing")
+		}
+	})
+}
+
+func TestCheckToken(t *testing.T) {
+	writeToken := func(t *testing.T, token string) string {
+		t.Helper()
+		tokenFile := filepath.Join(t.TempDir(), "token")
+		if err := os.WriteFile(tokenFile, []byte(token), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return tokenFile
+	}
+
+	t.Run("valid token", func(t *testing.T) {
+		if err := CheckToken(writeToken(t, generateJWT(t, time.Hour))); err != nil {
+			t.Errorf("CheckToken() returned an error for a valid token: %v", err)
+		}
+	})
+
+	t.Run("expired token", func(t *testing.T) {
+		if err := CheckToken(writeToken(t, generateJWT(t, -time.Minute))); err == nil {
+			t.Error("CheckToken() did not return an error for an expired token")
+		}
+	})
+
+	t.Run("malformed token", func(t *testing.T) {
+		if err := CheckToken(writeToken(t, "not-a-jwt")); err == nil {
+			t.Error("CheckToken() did not return an error for a malformed token")
+		}
+	})
+
+	t.Run("missing file", func(t *testing.T) {
+		if err := CheckToken(filepath.Join(t.TempDir(), "token")); err == nil {
+			t.Error("CheckToken() did not return an error for a missing file")
 		}
 	})
 }

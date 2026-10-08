@@ -19,7 +19,7 @@ import (
 type GSA struct {
 	Name     string // Name of the GSA (Google Service Account)
 	Audience string // Audience for the GSA token
-	Scope    string // Scope for the GSA token
+	Scope    string // Optional scope for the GSA token, omitted from the request when empty
 }
 
 var client = &http.Client{Timeout: 10 * time.Second}
@@ -53,10 +53,29 @@ func (g *GSA) RefreshToken(ctx context.Context, tokenFile, metadataServerURL str
 	return writeFileAtomic(tokenFile, token)
 }
 
+// CheckToken returns nil if tokenFile holds a JWT that has not yet expired.
+func CheckToken(tokenFile string) error {
+	data, err := os.ReadFile(tokenFile)
+	if err != nil {
+		return fmt.Errorf("reading token file: %w", err)
+	}
+	expIn, err := tokenExpiresIn(string(data))
+	if err != nil {
+		return err
+	}
+	if expIn <= 0 {
+		return fmt.Errorf("token expired %s ago", (-expIn).Round(time.Second))
+	}
+	return nil
+}
+
 // token fetches an identity token for the service account from the metadata
 // server.
 func (g *GSA) token(ctx context.Context, metadataServerURL string) ([]byte, error) {
-	query := url.Values{"audience": {g.Audience}, "scope": {g.Scope}}
+	query := url.Values{"audience": {g.Audience}}
+	if g.Scope != "" {
+		query.Set("scope", g.Scope)
+	}
 	requestURL := fmt.Sprintf("%s/computeMetadata/v1/instance/service-accounts/%s/identity?%s",
 		metadataServerURL, url.PathEscape(g.Name), query.Encode())
 	slog.Debug("requesting token from metadata server", "gsa", g.Name, "url", requestURL)
