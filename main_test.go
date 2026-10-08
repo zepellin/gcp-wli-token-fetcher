@@ -25,6 +25,12 @@ func TestNewConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("scope is optional", func(t *testing.T) {
+		if _, err := newConfig("/tmp/token", "gsa", "aud", "", "url", "1m", "30m"); err != nil {
+			t.Errorf("newConfig() returned an error for an empty scope: %v", err)
+		}
+	})
+
 	t.Run("missing required arguments", func(t *testing.T) {
 		_, err := newConfig("", "", "aud", "scope", "http://metadata.google.internal", "1m", "30m")
 		if err == nil {
@@ -51,6 +57,13 @@ func TestNewConfig(t *testing.T) {
 			t.Error("newConfig() did not return an error for a non-duration renewthreshold")
 		}
 	})
+}
+
+func TestCheckTokenRequiresFile(t *testing.T) {
+	err := checkToken("")
+	if err == nil || !strings.Contains(err.Error(), "-file") {
+		t.Errorf("checkToken(\"\") = %v, want an error mentioning -file", err)
+	}
 }
 
 func TestNewLogger(t *testing.T) {
