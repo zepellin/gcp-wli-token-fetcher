@@ -114,7 +114,7 @@ A shared `emptyDir` volume makes the token file visible to both containers:
 
 ```yaml
 spec:
-  serviceAccountName: atlantis # bound to GSA_NAME via Workload Identity
+  serviceAccountName: my-wli-sa-name # bound to GSA_NAME via Workload Identity
   initContainers:
     - name: gcp-wli-token-fetcher
       image: ghcr.io/zepellin/gcp-wli-token-fetcher:latest
@@ -128,7 +128,7 @@ spec:
         - name: TOKEN_FILE
           value: /var/run/tokensource/token
         - name: GSA_NAME
-          value: atlantis@gcp-project-name.iam.gserviceaccount.com
+          value: my-wli-sa-name@gcp-project-name.iam.gserviceaccount.com
         - name: TOKEN_AUDIENCE
           value: AzureADTokenExchange
         - name: TOKEN_SCOPE
@@ -141,7 +141,7 @@ spec:
         - name: tokenstore
           mountPath: /var/run/tokensource
   containers:
-    - name: atlantis
+    - name: workload-container
       # ...
       volumeMounts:
         - name: tokenstore
@@ -151,9 +151,6 @@ spec:
     - name: tokenstore
       emptyDir: {}
 ```
-
-With the Atlantis Helm chart, put the fetcher under `initContainers` and the
-volume under `extraVolumes`/`extraVolumeMounts`.
 
 #### Using `-check` in probes
 
